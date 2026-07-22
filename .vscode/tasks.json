@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Unmaek: Install",
+      "type": "shell",
+      "command": "npm.cmd install --registry=https://registry.npmjs.org/",
+      "problemMatcher": []
+    },
+    {
+      "label": "Unmaek: Dev Server",
+      "type": "shell",
+      "command": "npm.cmd run dev",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Unmaek: Test",
+      "type": "shell",
+      "command": "npm.cmd test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Unmaek: Build",
+      "type": "shell",
+      "command": "npm.cmd run build",
+      "problemMatcher": []
+    }
+  ]
+}
