@@ -43,6 +43,12 @@ button { font: inherit; }
   user-select: none;
 }
 
+.game-shell.is-busy,
+.game-shell.scene-unready { cursor: progress; }
+
+.game-shell.is-busy .bottom-overlay,
+.game-shell.scene-unready .bottom-overlay { filter: saturate(.55); }
+
 .phaser-stage,
 .phaser-stage canvas,
 .screen-vignette {
@@ -77,6 +83,8 @@ button { font: inherit; }
   padding: 8px 14px;
   cursor: pointer;
 }
+.reset-button:not(:disabled):hover { border-color: rgba(137, 226, 197, .58); background: rgba(20, 39, 45, .9); }
+.reset-button:disabled { opacity: .42; cursor: not-allowed; }
 
 .actor-hud {
   position: absolute;
@@ -133,7 +141,7 @@ button { font: inherit; }
 }
 .word-slot span { display: block; color: #baf7df; font-family: Georgia, "Noto Serif KR", serif; font-size: clamp(13px, 1.3vw, 19px); }
 .word-slot small { color: #8ba79e; }
-.word-slot.active:hover { transform: translateY(-5px); filter: brightness(1.12); }
+.word-slot.active:not(:disabled):hover { transform: translateY(-5px); filter: brightness(1.12); }
 .word-slot.locked { opacity: .38; }
 
 .skill-card {
@@ -146,7 +154,7 @@ button { font: inherit; }
   box-shadow: 0 8px 18px rgba(0, 0, 0, .36), inset 0 0 0 2px rgba(92, 72, 46, .25);
   text-align: left;
 }
-.skill-card.active:hover { transform: translateY(-12px) scale(1.03); z-index: 2; }
+.skill-card.active:not(:disabled):hover { transform: translateY(-12px) scale(1.03); z-index: 2; }
 .skill-card .cost { position: absolute; top: 5px; left: 7px; color: #e5c691; font-weight: 800; }
 .card-art { display: grid; place-items: center; height: 44px; color: #e6c49b; font-size: 36px; }
 .skill-card strong { display: block; margin-top: 3px; font-size: clamp(10px, 1vw, 14px); }

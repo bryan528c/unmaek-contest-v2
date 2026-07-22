@@ -19,16 +19,19 @@ export function canUseAction(
   actionId: ActionId,
   targetId: TargetId,
 ): boolean {
-  if (actionId === 'gap-slash') {
-    return targetId === 'enemy-body' && state.actionPoints >= 1 && state.enemyHp > 0;
+  switch (actionId) {
+    case 'gap-slash':
+      return targetId === 'enemy-body' && state.actionPoints >= 1 && state.enemyHp > 0;
+    case 'stop-word':
+      return (
+        targetId === 'enemy-intent' &&
+        state.wordCharges >= 1 &&
+        !state.enemyIntentCancelled &&
+        state.enemyHp > 0
+      );
+    default:
+      return assertUnsupportedAction(actionId);
   }
-
-  return (
-    targetId === 'enemy-intent' &&
-    state.wordCharges >= 1 &&
-    !state.enemyIntentCancelled &&
-    state.enemyHp > 0
-  );
 }
 
 export function resolveAction(
@@ -43,30 +46,38 @@ export function resolveAction(
     };
   }
 
-  if (actionId === 'gap-slash') {
-    const damage = 6;
-    return {
-      state: {
-        ...state,
-        enemyHp: Math.max(0, state.enemyHp - damage),
-        actionPoints: state.actionPoints - 1,
-        enemyGap: state.enemyGap + 1,
-        message: `틈새 베기: 피해 ${damage}, 틈 +1`,
-      },
-      events: [
-        { type: 'playerAttack', targetId: 'enemy-body', damage },
-        { type: 'gapAdded', targetId: 'enemy-body', amount: 1 },
-      ],
-    };
+  switch (actionId) {
+    case 'gap-slash': {
+      const damage = 6;
+      return {
+        state: {
+          ...state,
+          enemyHp: Math.max(0, state.enemyHp - damage),
+          actionPoints: state.actionPoints - 1,
+          enemyGap: state.enemyGap + 1,
+          message: `틈새 베기: 피해 ${damage}, 틈 +1`,
+        },
+        events: [
+          { type: 'playerAttack', targetId: 'enemy-body', damage },
+          { type: 'gapAdded', targetId: 'enemy-body', amount: 1 },
+        ],
+      };
+    }
+    case 'stop-word':
+      return {
+        state: {
+          ...state,
+          wordCharges: state.wordCharges - 1,
+          enemyIntentCancelled: true,
+          message: '멎는다: 내리치기가 취소되었습니다.',
+        },
+        events: [{ type: 'intentCancelled', targetId: 'enemy-intent' }],
+      };
+    default:
+      return assertUnsupportedAction(actionId);
   }
+}
 
-  return {
-    state: {
-      ...state,
-      wordCharges: state.wordCharges - 1,
-      enemyIntentCancelled: true,
-      message: '멎는다: 내리치기가 취소되었습니다.',
-    },
-    events: [{ type: 'intentCancelled', targetId: 'enemy-intent' }],
-  };
+function assertUnsupportedAction(actionId: never): never {
+  throw new Error(`Unsupported action ID: ${String(actionId)}`);
 }

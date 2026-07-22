@@ -14,12 +14,22 @@ export interface BattleState {
 }
 
 export type BattleEvent =
-  | { type: 'playerAttack'; targetId: 'enemy-body'; damage: number }
-  | { type: 'gapAdded'; targetId: 'enemy-body'; amount: number }
-  | { type: 'intentCancelled'; targetId: 'enemy-intent' }
-  | { type: 'resetScene' };
+  | {
+      readonly type: 'playerAttack';
+      readonly targetId: 'enemy-body';
+      readonly damage: number;
+    }
+  | {
+      readonly type: 'gapAdded';
+      readonly targetId: 'enemy-body';
+      readonly amount: number;
+    }
+  | {
+      readonly type: 'intentCancelled';
+      readonly targetId: 'enemy-intent';
+    };
 
 export interface ActionResult {
-  state: BattleState;
-  events: BattleEvent[];
+  readonly state: BattleState;
+  readonly events: readonly BattleEvent[];
 }

@@ -1,67 +1,134 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { PhaserStage } from './phaser/PhaserStage';
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import { gameBridge, type GameAnchor } from './bridge/GameBridge';
 import { createInitialBattleState, resolveAction } from './core/battleEngine';
-import type { ActionId, TargetId } from './core/types';
+import type { ActionId, BattleState, TargetId } from './core/types';
+import { PhaserStage } from './phaser/PhaserStage';
 import { DragItem } from './ui/DragItem';
+import {
+  findDropTarget,
+  getActionPreview,
+  getExpectedTargetKind,
+} from './ui/dragTargeting';
 
 interface DragState {
-  actionId: ActionId;
-  kind: 'card' | 'word';
-  label: string;
-  clientX: number;
-  clientY: number;
-  sourceX: number;
-  sourceY: number;
-  pointerId: number;
+  readonly actionId: ActionId;
+  readonly kind: 'card' | 'word';
+  readonly label: string;
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly sourceX: number;
+  readonly sourceY: number;
+  readonly pointerId: number;
 }
 
-function getExpectedKind(actionId: ActionId): GameAnchor['kind'] {
-  return actionId === 'gap-slash' ? 'actor' : 'intent';
+function subscribeBridgeStatus(onStoreChange: () => void): () => void {
+  return gameBridge.subscribeStatus(onStoreChange);
+}
+
+function getBridgeStatusSnapshot() {
+  return gameBridge.getSnapshot();
+}
+
+function isTargetId(id: string): id is TargetId {
+  switch (id) {
+    case 'enemy-body':
+    case 'enemy-intent':
+      return true;
+    default:
+      return false;
+  }
 }
 
 export function App() {
   const shellRef = useRef<HTMLDivElement>(null);
   const [battle, setBattle] = useState(createInitialBattleState);
-  const [anchors, setAnchors] = useState<GameAnchor[]>([]);
+  const battleRef = useRef<BattleState>(battle);
+  const [anchors, setAnchors] = useState<readonly GameAnchor[]>([]);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [hoveredTarget, setHoveredTarget] = useState<GameAnchor | null>(null);
+  const bridgeStatus = useSyncExternalStore(
+    subscribeBridgeStatus,
+    getBridgeStatusSnapshot,
+    getBridgeStatusSnapshot,
+  );
+  const inputLocked = bridgeStatus.busy || !bridgeStatus.sceneReady;
 
   useEffect(() => gameBridge.subscribeAnchors(setAnchors), []);
 
-  const targetPositions = useMemo(() => {
-    const rect = shellRef.current?.getBoundingClientRect();
-    if (!rect) return [];
-    return anchors.map((anchor) => ({
-      ...anchor,
-      clientX: rect.left + rect.width * anchor.x,
-      clientY: rect.top + rect.height * anchor.y,
-      hitRadius: Math.max(44, rect.width * anchor.radius),
-    }));
-  }, [anchors, drag?.clientX, drag?.clientY]);
+  useEffect(() => {
+    if (!inputLocked) {
+      return;
+    }
+
+    setDrag(null);
+    setHoveredTarget(null);
+  }, [inputLocked]);
+
+  useEffect(() => {
+    if (!bridgeStatus.sceneReady || bridgeStatus.busy) {
+      return;
+    }
+
+    gameBridge.sendSceneCommand({ type: 'resetScene', state: battleRef.current });
+  }, [bridgeStatus.busy, bridgeStatus.sceneReady, bridgeStatus.sceneVersion]);
+
+  function bridgeAllowsInput(): boolean {
+    const currentStatus = gameBridge.getSnapshot();
+    return currentStatus.sceneReady && !currentStatus.busy;
+  }
+
+  function targetAtPointer(
+    actionId: ActionId,
+    clientX: number,
+    clientY: number,
+    cancelled = false,
+  ): GameAnchor | null {
+    const bounds = shellRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return null;
+    }
+
+    return findDropTarget({ actionId, clientX, clientY, anchors, bounds, cancelled });
+  }
 
   function updateHoveredTarget(nextDrag: DragState): void {
-    const expected = getExpectedKind(nextDrag.actionId);
-    let best: (GameAnchor & { distance: number }) | null = null;
+    setHoveredTarget(targetAtPointer(nextDrag.actionId, nextDrag.clientX, nextDrag.clientY));
+  }
 
-    targetPositions.forEach((target) => {
-      if (target.kind !== expected) return;
-      const distance = Math.hypot(nextDrag.clientX - target.clientX, nextDrag.clientY - target.clientY);
-      if (distance <= target.hitRadius && (!best || distance < best.distance)) {
-        best = { ...target, distance };
-      }
+  function clearDrag(): void {
+    setDrag(null);
+    setHoveredTarget(null);
+  }
+
+  function commitBattle(nextState: BattleState): void {
+    battleRef.current = nextState;
+    setBattle(nextState);
+  }
+
+  function updateBattleMessage(message: string): void {
+    setBattle((current) => {
+      const nextState = { ...current, message };
+      battleRef.current = nextState;
+      return nextState;
     });
-
-    setHoveredTarget(best);
   }
 
   function beginDrag(
-    event: React.PointerEvent<HTMLButtonElement>,
+    event: ReactPointerEvent<HTMLButtonElement>,
     actionId: ActionId,
     kind: DragState['kind'],
     label: string,
   ): void {
-    if (!shellRef.current) return;
+    if (!shellRef.current || !bridgeAllowsInput()) {
+      return;
+    }
+
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
 
@@ -82,39 +149,74 @@ export function App() {
     updateHoveredTarget(nextDrag);
   }
 
-  function moveDrag(event: React.PointerEvent<HTMLDivElement>): void {
-    if (!drag || event.pointerId !== drag.pointerId) return;
+  function moveDrag(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+
+    if (!bridgeAllowsInput()) {
+      clearDrag();
+      return;
+    }
+
     const nextDrag = { ...drag, clientX: event.clientX, clientY: event.clientY };
     setDrag(nextDrag);
     updateHoveredTarget(nextDrag);
   }
 
-  function endDrag(event: React.PointerEvent<HTMLDivElement>): void {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-
-    if (hoveredTarget) {
-      const result = resolveAction(battle, drag.actionId, hoveredTarget.id as TargetId);
-      setBattle(result.state);
-      gameBridge.emitBattleEvents(result.events);
-    } else {
-      setBattle((current) => ({ ...current, message: '유효한 대상 위에 놓아 주세요.' }));
+  function finishDrag(event: ReactPointerEvent<HTMLDivElement>, cancelled: boolean): void {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
     }
 
-    setDrag(null);
-    setHoveredTarget(null);
+    const finalTarget = targetAtPointer(
+      drag.actionId,
+      event.clientX,
+      event.clientY,
+      cancelled,
+    );
+    clearDrag();
+
+    if (cancelled || !bridgeAllowsInput()) {
+      return;
+    }
+
+    if (!finalTarget || !isTargetId(finalTarget.id)) {
+      updateBattleMessage('유효한 대상 위에 놓아 주세요.');
+      return;
+    }
+
+    void gameBridge.enqueueBattleAction(() => {
+      const result = resolveAction(battleRef.current, drag.actionId, finalTarget.id);
+      return {
+        events: result.events,
+        commit: () => commitBattle(result.state),
+        onFailure: () => {
+          gameBridge.sendSceneCommand({ type: 'resetScene', state: battleRef.current });
+        },
+      };
+    });
   }
 
   function resetProof(): void {
-    setBattle(createInitialBattleState());
-    setDrag(null);
-    setHoveredTarget(null);
-    gameBridge.emitBattleEvents([{ type: 'resetScene' }]);
+    if (!bridgeAllowsInput()) {
+      return;
+    }
+
+    const initialState = createInitialBattleState();
+    if (!gameBridge.sendSceneCommand({ type: 'resetScene', state: initialState })) {
+      return;
+    }
+
+    clearDrag();
+    commitBattle(initialState);
   }
 
   const shellRect = shellRef.current?.getBoundingClientRect();
   const pointerInShell = drag && shellRect
     ? { x: drag.clientX - shellRect.left, y: drag.clientY - shellRect.top }
     : null;
+  const dragPreview = drag ? getActionPreview(drag.actionId) : null;
 
   return (
     <main className="page-shell">
@@ -128,10 +230,11 @@ export function App() {
 
       <div
         ref={shellRef}
-        className={`game-shell ${drag?.kind === 'word' ? 'word-mode' : ''}`}
+        className={`game-shell ${drag?.kind === 'word' ? 'word-mode' : ''} ${bridgeStatus.busy ? 'is-busy' : ''} ${bridgeStatus.sceneReady ? '' : 'scene-unready'}`}
+        aria-busy={inputLocked}
         onPointerMove={moveDrag}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
+        onPointerUp={(event) => finishDrag(event, false)}
+        onPointerCancel={(event) => finishDrag(event, true)}
       >
         <PhaserStage />
 
@@ -142,7 +245,12 @@ export function App() {
             <span className="location">무너진 기록실 입구</span>
             <span className="stage-count">1 / 3</span>
           </div>
-          <button className="reset-button" type="button" onClick={resetProof}>
+          <button
+            className="reset-button"
+            type="button"
+            disabled={inputLocked}
+            onClick={resetProof}
+          >
             검증 초기화
           </button>
         </section>
@@ -171,7 +279,7 @@ export function App() {
         </section>
 
         {drag && anchors.map((anchor) => {
-          const valid = anchor.kind === getExpectedKind(drag.actionId);
+          const valid = anchor.kind === getExpectedTargetKind(drag.actionId);
           return (
             <div
               key={anchor.id}
@@ -204,16 +312,13 @@ export function App() {
           </div>
         )}
 
-        {hoveredTarget && drag && (
+        {hoveredTarget && dragPreview && (
           <div
             className="target-preview"
             style={{ left: `${hoveredTarget.x * 100}%`, top: `${hoveredTarget.y * 100}%` }}
           >
-            {drag.actionId === 'gap-slash' ? (
-              <><strong>틈새 베기</strong><span>피해 6 · 틈 +1</span></>
-            ) : (
-              <><strong>내리치기 취소</strong><span>받을 피해 9 → 0</span></>
-            )}
+            <strong>{dragPreview.title}</strong>
+            <span>{dragPreview.detail}</span>
           </div>
         )}
 
@@ -222,7 +327,7 @@ export function App() {
             <div className="resource-label">언령 {battle.wordCharges} / 2</div>
             <DragItem
               className="word-slot active"
-              disabled={battle.wordCharges < 1 || battle.enemyIntentCancelled}
+              disabled={inputLocked || battle.wordCharges < 1 || battle.enemyIntentCancelled}
               onPointerDown={(event) => beginDrag(event, 'stop-word', 'word', '멎는다.')}
             >
               <span>멎는다.</span>
@@ -235,7 +340,7 @@ export function App() {
             <div className="resource-label">행동력 {battle.actionPoints} / 3</div>
             <DragItem
               className="skill-card active"
-              disabled={battle.actionPoints < 1 || battle.enemyHp <= 0}
+              disabled={inputLocked || battle.actionPoints < 1 || battle.enemyHp <= 0}
               onPointerDown={(event) => beginDrag(event, 'gap-slash', 'card', '틈새 베기')}
             >
               <span className="cost">1</span>
@@ -247,7 +352,7 @@ export function App() {
             <div className="skill-card placeholder"><span className="cost">0</span><strong>숨 고르기</strong><small>다음 검증</small></div>
           </section>
 
-          <aside className="proof-status">
+          <aside className="proof-status" aria-live="polite">
             <span>현재 결과</span>
             <strong>{battle.message}</strong>
           </aside>

@@ -1,6 +1,16 @@
 import Phaser from 'phaser';
-import { gameBridge } from '../../bridge/GameBridge';
-import type { BattleEvent } from '../../core/types';
+import { gameBridge, type SceneCommand } from '../../bridge/GameBridge';
+import type { BattleEvent, BattleState } from '../../core/types';
+
+function assertNever(value: never): never {
+  throw new Error(`지원하지 않는 전투 사건입니다: ${String(value)}`);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new Error('전투 장면 사건 재생이 취소되었습니다.');
+  }
+}
 
 export class BattleScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Sprite;
@@ -8,13 +18,16 @@ export class BattleScene extends Phaser.Scene {
   private enemyIntent!: Phaser.GameObjects.Text;
   private enemyIntentValue!: Phaser.GameObjects.Text;
   private crack!: Phaser.GameObjects.Graphics;
-  private unsubscribe?: () => void;
+  private disposeSceneConsumer?: () => void;
+  private readonly transientObjects = new Set<Phaser.GameObjects.GameObject>();
 
   constructor() {
     super('BattleScene');
   }
 
   create(): void {
+    this.disposeSceneConsumer?.();
+    this.disposeSceneConsumer = undefined;
     this.createTextures();
     this.createBackground();
 
@@ -52,11 +65,23 @@ export class BattleScene extends Phaser.Scene {
     this.crack = this.add.graphics();
     this.publishAnchors();
 
-    this.unsubscribe = gameBridge.subscribeBattleEvents((events) => {
-      void this.playEvents(events);
+    const dispose = gameBridge.registerSceneConsumer({
+      playBattleEvents: (events, signal) => this.playEvents(events, signal),
+      handleSceneCommand: (command) => this.handleSceneCommand(command),
     });
+    this.disposeSceneConsumer = dispose;
 
-    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.unsubscribe?.());
+    let cleanedUp = false;
+    const cleanUp = (): void => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      dispose();
+      if (this.disposeSceneConsumer === dispose) {
+        this.disposeSceneConsumer = undefined;
+      }
+    };
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, cleanUp);
+    this.events.once(Phaser.Scenes.Events.DESTROY, cleanUp);
   }
 
   private createBackground(): void {
@@ -153,22 +178,50 @@ export class BattleScene extends Phaser.Scene {
     ]);
   }
 
-  private async playEvents(events: BattleEvent[]): Promise<void> {
+  private async playEvents(
+    events: readonly BattleEvent[],
+    signal: AbortSignal,
+  ): Promise<void> {
     for (const event of events) {
-      if (event.type === 'playerAttack') {
-        await this.playAttack(event.damage);
-      } else if (event.type === 'gapAdded') {
-        this.drawCrack();
-      } else if (event.type === 'intentCancelled') {
-        await this.playStopWord();
-      } else if (event.type === 'resetScene') {
-        this.resetScene();
+      throwIfAborted(signal);
+      switch (event.type) {
+        case 'playerAttack':
+          await this.playAttack(event.damage, signal);
+          break;
+        case 'gapAdded':
+          this.drawCrack();
+          break;
+        case 'intentCancelled':
+          await this.playStopWord(signal);
+          break;
+        default:
+          assertNever(event);
       }
+      throwIfAborted(signal);
     }
   }
 
-  private playAttack(damage: number): Promise<void> {
-    return new Promise((resolve) => {
+  private playAttack(damage: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let playerReturned = false;
+      let damageFinished = false;
+      let settled = false;
+      const finishIfComplete = (): void => {
+        if (settled || !playerReturned || !damageFinished) return;
+        settled = true;
+        signal.removeEventListener('abort', handleAbort);
+        resolve();
+      };
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', handleAbort);
+        this.cancelActivePresentation();
+        reject(error);
+      };
+      const handleAbort = (): void => fail(new Error('플레이어 공격 연출이 취소되었습니다.'));
+      signal.addEventListener('abort', handleAbort, { once: true });
+
       const startX = this.player.x;
       this.tweens.add({
         targets: this.player,
@@ -176,49 +229,76 @@ export class BattleScene extends Phaser.Scene {
         duration: 135,
         ease: 'Quad.easeIn',
         onComplete: () => {
-          const slash = this.add.graphics();
-          slash.lineStyle(5, 0xf0d0a4, 0.95);
-          slash.beginPath();
-          slash.arc(this.enemy.x - 8, this.enemy.y - 35, 45, 2.5, 5.6, false);
-          slash.strokePath();
-          this.time.delayedCall(85, () => slash.destroy());
-
-          const damageText = this.add
-            .text(this.enemy.x, this.enemy.y - 94, `-${damage}`, {
-              fontFamily: 'sans-serif',
-              fontSize: '17px',
-              color: '#ffd4c7',
-              stroke: '#15191f',
-              strokeThickness: 3,
-            })
-            .setOrigin(0.5);
-
-          this.tweens.add({
-            targets: damageText,
-            y: damageText.y - 18,
-            alpha: 0,
-            duration: 520,
-            onComplete: () => damageText.destroy(),
-          });
-
-          this.cameras.main.shake(75, 0.0045);
-          this.tweens.add({
-            targets: this.enemy,
-            x: this.enemy.x + 7,
-            duration: 45,
-            yoyo: true,
-            repeat: 2,
-          });
-
-          this.time.delayedCall(80, () => {
-            this.tweens.add({
-              targets: this.player,
-              x: startX,
-              duration: 155,
-              ease: 'Quad.easeOut',
-              onComplete: () => resolve(),
+          if (settled) return;
+          try {
+            const slash = this.trackTransient(this.add.graphics());
+            slash.lineStyle(5, 0xf0d0a4, 0.95);
+            slash.beginPath();
+            slash.arc(this.enemy.x - 8, this.enemy.y - 35, 45, 2.5, 5.6, false);
+            slash.strokePath();
+            this.time.delayedCall(85, () => {
+              try {
+                slash.destroy();
+              } catch (error: unknown) {
+                fail(error);
+              }
             });
-          });
+
+            const damageText = this.trackTransient(this.add
+              .text(this.enemy.x, this.enemy.y - 94, `-${damage}`, {
+                fontFamily: 'sans-serif',
+                fontSize: '17px',
+                color: '#ffd4c7',
+                stroke: '#15191f',
+                strokeThickness: 3,
+              })
+              .setOrigin(0.5));
+
+            this.tweens.add({
+              targets: damageText,
+              y: damageText.y - 18,
+              alpha: 0,
+              duration: 520,
+              onComplete: () => {
+                try {
+                  damageText.destroy();
+                  damageFinished = true;
+                  finishIfComplete();
+                } catch (error: unknown) {
+                  fail(error);
+                }
+              },
+            });
+
+            this.cameras.main.shake(75, 0.0045);
+            this.tweens.add({
+              targets: this.enemy,
+              x: this.enemy.x + 7,
+              duration: 45,
+              yoyo: true,
+              repeat: 2,
+            });
+
+            this.time.delayedCall(80, () => {
+              if (settled) return;
+              try {
+                this.tweens.add({
+                  targets: this.player,
+                  x: startX,
+                  duration: 155,
+                  ease: 'Quad.easeOut',
+                  onComplete: () => {
+                    playerReturned = true;
+                    finishIfComplete();
+                  },
+                });
+              } catch (error: unknown) {
+                fail(error);
+              }
+            });
+          } catch (error: unknown) {
+            fail(error);
+          }
         },
       });
     });
@@ -235,9 +315,20 @@ export class BattleScene extends Phaser.Scene {
     this.crack.strokePath();
   }
 
-  private playStopWord(): Promise<void> {
-    return new Promise((resolve) => {
-      const word = this.add
+  private playStopWord(signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', handleAbort);
+        this.cancelActivePresentation();
+        reject(error);
+      };
+      const handleAbort = (): void => fail(new Error('언령 연출이 취소되었습니다.'));
+      signal.addEventListener('abort', handleAbort, { once: true });
+
+      const word = this.trackTransient(this.add
         .text(188, 286, '멎는다.', {
           fontFamily: 'serif',
           fontSize: '21px',
@@ -245,9 +336,9 @@ export class BattleScene extends Phaser.Scene {
           stroke: '#0d1717',
           strokeThickness: 4,
         })
-        .setOrigin(0.5);
+        .setOrigin(0.5));
 
-      const thread = this.add.graphics();
+      const thread = this.trackTransient(this.add.graphics());
       thread.lineStyle(2, 0x86e6c8, 0.95);
       thread.beginPath();
       thread.moveTo(word.x + 26, word.y - 4);
@@ -261,41 +352,100 @@ export class BattleScene extends Phaser.Scene {
         duration: 320,
         ease: 'Sine.easeInOut',
         onComplete: () => {
-          this.enemyIntent.setColor('#89e2c5');
-          this.enemyIntent.setText('내리\n친다');
-          this.enemyIntent.setLineSpacing(-4);
-          this.enemyIntentValue.setText('피해 없음').setColor('#9ad5c0');
-          this.enemy.setTint(0x9bc8b9);
+          if (settled) return;
+          try {
+            this.enemyIntent.setColor('#89e2c5');
+            this.enemyIntent.setText('내리\n친다');
+            this.enemyIntent.setLineSpacing(-4);
+            this.enemyIntentValue.setText('피해 없음').setColor('#9ad5c0');
+            this.enemy.setTint(0x9bc8b9);
 
-          const fragments = Array.from({ length: 8 }, (_, index) =>
-            this.add.rectangle(
-              this.enemy.x - 25 + index * 7,
-              this.enemy.y - 70 + (index % 3) * 7,
-              3,
-              3,
-              0xa9e7d3,
-              0.9,
-            ),
-          );
+            const fragments = Array.from({ length: 8 }, (_, index) =>
+              this.trackTransient(this.add.rectangle(
+                this.enemy.x - 25 + index * 7,
+                this.enemy.y - 70 + (index % 3) * 7,
+                3,
+                3,
+                0xa9e7d3,
+                0.9,
+              )),
+            );
 
-          this.time.delayedCall(145, () => {
-            fragments.forEach((fragment) => fragment.destroy());
-            thread.destroy();
-            word.destroy();
-            this.enemy.clearTint();
-            resolve();
-          });
+            this.time.delayedCall(145, () => {
+              if (settled) return;
+              try {
+                fragments.forEach((fragment) => fragment.destroy());
+                thread.destroy();
+                word.destroy();
+                this.enemy.clearTint();
+                settled = true;
+                signal.removeEventListener('abort', handleAbort);
+                resolve();
+              } catch (error: unknown) {
+                fail(error);
+              }
+            });
+          } catch (error: unknown) {
+            fail(error);
+          }
         },
       });
     });
   }
 
-  private resetScene(): void {
+  private handleSceneCommand(command: SceneCommand): void {
+    const commandType = command.type;
+    switch (commandType) {
+      case 'resetScene':
+        this.resetScene(command.state);
+        return;
+      default:
+        assertNever(commandType);
+    }
+  }
+
+  private resetScene(state: BattleState): void {
+    this.cancelActivePresentation();
     this.player.setPosition(150, 215);
     this.enemy.setPosition(485, 220).clearTint();
-    this.enemyIntent.setText('내리친다').setColor('#f1ded3').setLineSpacing(0);
-    this.enemyIntentValue.setText('피해 9').setColor('#d8a095');
-    this.crack.clear();
+    if (state.enemyIntentCancelled) {
+      this.enemyIntent.setText('내리\n친다').setColor('#89e2c5').setLineSpacing(-4);
+      this.enemyIntentValue.setText('피해 없음').setColor('#9ad5c0');
+    } else {
+      this.enemyIntent.setText('내리친다').setColor('#f1ded3').setLineSpacing(0);
+      this.enemyIntentValue.setText('피해 9').setColor('#d8a095');
+    }
+    if (state.enemyGap > 0) {
+      this.drawCrack();
+    } else {
+      this.crack.clear();
+    }
     this.cameras.main.resetFX();
+  }
+
+  private cancelActivePresentation(): void {
+    this.tweens.killTweensOf(this.player);
+    this.tweens.killTweensOf(this.enemy);
+    this.time.removeAllEvents();
+    this.destroyTransientObjects();
+    this.enemy.clearTint();
+    this.cameras.main.resetFX();
+  }
+
+  private trackTransient<T extends Phaser.GameObjects.GameObject>(gameObject: T): T {
+    this.transientObjects.add(gameObject);
+    gameObject.once(Phaser.GameObjects.Events.DESTROY, () => {
+      this.transientObjects.delete(gameObject);
+    });
+    return gameObject;
+  }
+
+  private destroyTransientObjects(): void {
+    const objects = [...this.transientObjects];
+    this.transientObjects.clear();
+    objects.forEach((gameObject) => {
+      this.tweens.killTweensOf(gameObject);
+      if (gameObject.active) gameObject.destroy();
+    });
   }
 }
